@@ -1,183 +1,212 @@
 use core::{mem::MaybeUninit, sync::atomic::{Ordering, AtomicU8}, cell::UnsafeCell};
-use core::pin::Pin;
+use core::{mem::ManuallyDrop};
 use futures::{Future, task::AtomicWaker};
-use crate::utils::AwaitInit;
+use crate::{utils::{AwaitInit}};
 
 #[cfg(not(debug_assertions))]
 use core::hint::unreachable_unchecked;
 
-#[cfg(feature = "alloc")]
-extern crate alloc;
-#[cfg(feature = "alloc")]
-use alloc::boxed::Box;
-
-cfg_if::cfg_if! {
-    if #[cfg(any(feature = "std", feature = "alloc"))] {
-        #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-        pub type DynFuture<'a, T> = Pin<Box<dyn 'a + Future<Output = T> + Sync>>;
-
-        #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-        pub type DynAsyncLazy<'a, T, F = fn() -> DynFuture<'a, T>> = AsyncLazy<T, DynFuture<'a, T>, F>;
-
-        impl<T, F: FnOnce() -> dyn Future<Output = T>> DynAsyncLazy<'_, T, F> {
-            #[inline(always)]
-            pub const fn new_boxed<Fn: > (f: F) -> Self {
-                let f = move || Box::pin(f);
-                Self::new()
-            }
-        }
-    }
-}
-
 /// A lazy value that initializes via future
-pub struct AsyncLazy<T, Fut, F = fn() -> Fut> {
+#[cfg_attr(docsrs, doc(cfg(feature = "futures")))]
+#[derive(Debug)]
+pub struct AsyncLazy<T, F> {
     state: AtomicU8,
     waker: AtomicWaker,
-    f: UnsafeCell<MaybeUninit<F>>,
-    fut: UnsafeCell<MaybeUninit<Fut>>,
-    value: UnsafeCell<MaybeUninit<T>>
+    value: UnsafeCell<MaybeUninit<T>>,
+    f: UnsafeCell<MaybeUninit<F>>
 }
 
-impl<T, Fut, F> AsyncLazy<T, Fut, F> {
+impl<T, F> AsyncLazy<T, F> {
+    /// Builds a new ```AsyncLazy``` value
     #[inline(always)]
     pub const fn new (f: F) -> Self {
         Self {
             state: AtomicU8::new(0),
             waker: AtomicWaker::new(),
-            f: UnsafeCell::new(MaybeUninit::new(f)),
-            fut: UnsafeCell::new(MaybeUninit::uninit()),
-            value: UnsafeCell::new(MaybeUninit::uninit())
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+            f: UnsafeCell::new(MaybeUninit::new(f))
         }
     }
 
+    /// Builds an ```AsyncLazy``` value that's already initialized
     #[inline(always)]
-    pub const fn by_future (fut: Fut) -> Self {
+    pub const fn init (value: T) -> Self {
         Self {
             state: AtomicU8::new(2),
             waker: AtomicWaker::new(),
-            f: UnsafeCell::new(MaybeUninit::uninit()),
-            fut: UnsafeCell::new(MaybeUninit::new(fut)),
-            value: UnsafeCell::new(MaybeUninit::uninit())
+            value: UnsafeCell::new(MaybeUninit::new(value)),
+            f: UnsafeCell::new(MaybeUninit::uninit())
         }
+    }
+
+    /// Returns ```true``` if the value is uninitialized, ```false``` otherwise
+    #[inline(always)]
+    pub fn is_uninit (&self) -> bool {
+        self.state.load(Ordering::Acquire) == 0
+    }
+    
+    /// Returns ```true``` if the value is currently initializing, ```false``` otherwise
+    #[inline(always)]
+    pub fn is_init (&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+    
+    /// Returns ```true``` if the value has already initialized, ```false``` otherwise
+    #[inline(always)]
+    pub fn has_init (&self) -> bool {
+        self.state.load(Ordering::Acquire) > 1
     }
 }
 
-impl<T, Fut: Future<Output = T>, F: FnOnce() -> Fut> AsyncLazy<T, Fut, F> {
-    pub async fn get (&self) -> &Fut::Output {
-        self.init_fut().await;
-        
-        match self.state.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed) {
-            // uninitialized
-            Ok(2) => unsafe {
-                let fut = core::mem::replace(&mut *self.fut.get(), MaybeUninit::uninit());
-                (&mut *self.value.get()).write(fut.assume_init().await);
-
-                #[cfg(debug_assertions)]
-                assert_eq!(self.state.swap(4, Ordering::Release), 3);
-                #[cfg(not(debug_assertions))]
-                self.state.store(4, Ordering::Release);
-            },
-
-            // currently initializing
-            Ok(3) => AwaitInit::new(4, &self.state, &self.waker).await,
-
-            // initialized
-            Ok(4) => {},
-
-            #[cfg(debug_assertions)]
-            _ => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            _ => unsafe { unreachable_unchecked() },
-        }
-
-        unsafe { (&*self.value.get()).assume_init_ref() }
-    }
-
-    pub async fn get_mut (&mut self) -> &mut Fut::Output {
-        self.init_fut().await;
-        
-        match self.state.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed) {
-            // uninitialized
-            Ok(2) => unsafe {
-                let fut = core::mem::replace(&mut *self.fut.get(), MaybeUninit::uninit());
-                (&mut *self.value.get()).write(fut.assume_init().await);
-                self.waker.wake();
-
-                #[cfg(debug_assertions)]
-                assert_eq!(self.state.swap(4, Ordering::Release), 3);
-                #[cfg(not(debug_assertions))]
-                self.state.store(4, Ordering::Release);
-            },
-
-            // currently initializing
-            Ok(3) => AwaitInit::new(4, &self.state, &self.waker).await,
-
-            // initialized
-            Ok(4) => {},
-
-            #[cfg(debug_assertions)]
-            _ => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            _ => unsafe { unreachable_unchecked() },
-        }
-
-        unsafe { self.value.get_mut().assume_init_mut() }
-    }
-
-    /// Asserts that the future is initialized, and initializes it if needed
-    async fn init_fut (&self) {
-        match self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed) {
-            #[cfg(debug_assertions)]
-            Err(_) => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            Err(_) => unsafe { unreachable_unchecked() },
-
+impl<T, F: Future<Output = T>> AsyncLazy<T, F> {
+    /// Returns a reference to the inner value, initializing or waiting for it of necesary
+    #[inline(always)]
+    pub async fn get (&self) -> &T {
+        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             // uninitialized
             Ok(0) => unsafe {
                 let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
-                (&mut *self.fut.get()).write((f.assume_init())());
-                self.waker.wake();
+                (&mut *self.value.get()).write(f.assume_init().await);
 
                 #[cfg(debug_assertions)]
                 assert_eq!(self.state.swap(2, Ordering::Release), 1);
                 #[cfg(not(debug_assertions))]
                 self.state.store(2, Ordering::Release);
+                self.waker.wake();
             },
 
             // currently initializing
-            Ok(1) => AwaitInit::new(2, &self.state, &self.waker).await,
+            Err(1) => AwaitInit::new(2, &self.state, &self.waker).await,
 
             // initialized
-            _ => {}
-        }
-    }
-}
-
-impl<T, Fut, F> Drop for AsyncLazy<T, Fut, F> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        match self.state.load(Ordering::Relaxed) {
-            // future uninit
-            0 => unsafe { self.f.get_mut().assume_init_drop() },
-
-            // initializing future
-            1 => todo!(),
-
-            // future init
-            2 => unsafe { self.fut.get_mut().assume_init_drop() },
-
-            // initializing value
-            3 => todo!(),
-
-            // value init
-            4 => unsafe { self.value.get_mut().assume_init_drop() },
+            Err(2) => {},
 
             #[cfg(debug_assertions)]
             _ => unreachable!(),
             #[cfg(not(debug_assertions))]
             _ => unsafe { unreachable_unchecked() }
         }
+
+        unsafe { (&*self.value.get()).assume_init_ref() }
+    }
+
+    /// Returns a mutable reference to the inner value, initializing or waiting for it of necesary
+    #[inline(always)]
+    pub async fn get_mut (&mut self) -> &mut T {
+        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+            // uninitialized
+            Ok(0) => unsafe {
+                let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
+                (&mut *self.value.get()).write(f.assume_init().await);
+
+                #[cfg(debug_assertions)]
+                assert_eq!(self.state.swap(2, Ordering::Release), 1);
+                #[cfg(not(debug_assertions))]
+                self.state.store(2, Ordering::Release);
+                self.waker.wake();
+            },
+
+            // currently initializing
+            Err(1) => AwaitInit::new(2, &self.state, &self.waker).await,
+
+            // initialized
+            Err(2) => {},
+
+            #[cfg(debug_assertions)]
+            _ => unreachable!(),
+            #[cfg(not(debug_assertions))]
+            _ => unsafe { unreachable_unchecked() }
+        }
+
+        unsafe { self.value.get_mut().assume_init_mut() }
+    }
+
+    /// Returns ```Some(ref value)``` if the value has already initialized, ```None``` otherwise
+    #[inline(always)]
+    pub fn try_get (&self) -> Option<&T> {
+        match self.state.load(Ordering::Acquire) {
+            2 => unsafe { Some((&*self.value.get()).assume_init_ref()) }
+            _ => None
+        }
+    }
+
+    /// Returns ```Some(ref mut value)``` if the value has already initialized, ```None``` otherwise
+    #[inline(always)]
+    pub fn try_get_mut (&mut self) -> Option<&mut T> {
+        match self.state.load(Ordering::Acquire) {
+            2 => unsafe { Some(self.value.get_mut().assume_init_mut()) }
+            _ => None
+        }
+    }
+
+    /// Returns the inner value, initializing it if necessary
+    #[inline(always)]
+    pub async fn into_inner (self) -> T {
+        let mut this = ManuallyDrop::new(self);
+
+        match this.state.load(Ordering::Relaxed) {
+            // uninit (init value)
+            0 => unsafe { 
+                let f = core::mem::replace(this.f.get_mut(), MaybeUninit::uninit()).assume_init();
+                f.await
+            },
+
+            // currently initializing
+            1 => unsafe {
+                AwaitInit::new(2, &this.state, &this.waker).await;
+                let value = core::mem::replace(this.value.get_mut(), MaybeUninit::uninit());
+                value.assume_init()
+            },
+
+            // init
+            _ => unsafe {
+                let value = core::mem::replace(this.value.get_mut(), MaybeUninit::uninit());
+                value.assume_init()
+            }
+        }
     }
 }
 
-unsafe impl<T: Sync, Fut: Sync, F: Sync> Sync for AsyncLazy<T, Fut, F> {}
+impl<T, F> From<T> for AsyncLazy<T, F> {
+    #[inline(always)]
+    fn from(x: T) -> Self {
+        Self::init(x)
+    }
+}
+
+impl<T, F> Drop for AsyncLazy<T, F> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        match self.state.load(Ordering::Relaxed) {
+            // uninit (drop future)
+            0 => return unsafe { self.f.get_mut().assume_init_drop() },
+
+            // currently initializing
+            1 => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
+
+            // init (drop value)
+            _ => {}
+        }
+
+        unsafe { self.value.get_mut().assume_init_drop() }
+    }
+}
+
+unsafe impl<T: Send, F: Send> Send for AsyncLazy<T, F> {}
+unsafe impl<T: Sync, F: Sync> Sync for AsyncLazy<T, F> {}
+
+/// Creates a new ```AsyncLazy``` without having to specify the future's return type
+#[cfg_attr(docsrs, doc(cfg(feature = "futures")))]
+#[cfg(feature = "nightly")]
+#[inline(always)]
+pub const fn async_lazy<F: Future> (f: F) -> AsyncLazy<F::Output, F> {
+    AsyncLazy::new(f)
+}
+
+/// Creates a new ```AsyncLazy``` without having to specify the future's return type
+#[cfg_attr(docsrs, doc(cfg(feature = "futures")))]
+#[cfg(not(feature = "nightly"))]
+#[inline(always)]
+pub fn async_lazy<F: Future> (f: F) -> AsyncLazy<F::Output, F> {
+    AsyncLazy::new(f)
+}

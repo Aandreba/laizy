@@ -1,18 +1,18 @@
 [package]
 name = "laizy"
+description = "A simple, stable and thread-safe implementation of a lazy value"
 version = "0.1.0"
 edition = "2021"
-
-[features]
-default = ["std"]
-std = []
-alloc = []
+license = "MIT OR Apache-2.0"
+repository = ""
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+nightly = []
 
 [dependencies]
 cfg-if = "1"

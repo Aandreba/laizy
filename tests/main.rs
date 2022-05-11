@@ -1,15 +1,31 @@
-use std::{time::Duration};
-use laizy::{AsyncLazy, DynAsyncLazy};
-use tokio::sync::Mutex;
+use std::{sync::{Mutex}};
+use laizy::{Lazy};
 
-static VEC : DynAsyncLazy<Mutex<Vec<u8>>> = DynAsyncLazy::new_boxed(init_vec);
+static SYNC : Lazy<Mutex<Vec<u8>>> = Lazy::new(|| Mutex::new(Vec::with_capacity(10)));
 
-#[tokio::test]
-async fn noblock () {
-    let vec = AsyncLazy::new_boxed(init_vec);
+#[test]
+fn simple () {
+    let vec = SYNC.lock().unwrap();
+    println!("{}", vec.capacity());
 }
 
-async fn init_vec() -> Mutex<Vec<u8>> {
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    Mutex::new(Vec::<u8>::with_capacity(10))
+#[test]
+fn threaded () {
+    let mut handles = Vec::new();
+    for i in 1..=4 {
+       handles.push(std::thread::spawn(move || {
+            let mut vec = SYNC.lock().unwrap();
+            vec.push(i);
+            println!("{vec:?}")
+        }));
+    }
+
+    let mut vec = SYNC.lock().unwrap();
+    vec.push(0);
+    println!("{vec:?}");
+    drop(vec);
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }

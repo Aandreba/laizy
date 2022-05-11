@@ -1,9 +1,6 @@
+#![no_std]
 #![doc = include_str!("../README.md")]
-#![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-
-#[cfg(all(feature = "std", feature = "alloc"))]
-compile_error!("Crate features std and alloc cannot be anabled simultaneously");
 
 mod utils;
 use core::{sync::atomic::{Ordering, AtomicU8}, mem::{MaybeUninit, ManuallyDrop}, cell::{UnsafeCell}, ops::{Deref, DerefMut}};
@@ -14,7 +11,6 @@ use core::hint::unreachable_unchecked;
 cfg_if::cfg_if! {
     if #[cfg(feature = "futures")] {
         mod asnc;
-        #[cfg_attr(docsrs, doc(cfg(feature = "futures")))]
         pub use asnc::*;
     }
 }
@@ -65,7 +61,7 @@ impl<T, F> Lazy<T, F> {
     /// Returns ```true``` if the value has already initialized, ```false``` otherwise
     #[inline(always)]
     pub fn has_init (&self) -> bool {
-        self.state.load(Ordering::Acquire) > 1
+        self.state.load(Ordering::Acquire) == 2
     }
 }
 
@@ -73,12 +69,7 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     /// Returns a reference to the inner value, initializing or waiting for it of necesary
     #[inline(always)]
     pub fn get (&self) -> &T {
-        match self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed) {
-            #[cfg(debug_assertions)]
-            Err(_) => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            Err(_) => unsafe { unreachable_unchecked() },
-
+        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             // uninitialized
             Ok(0) => unsafe {
                 let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
@@ -91,10 +82,15 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
             },
 
             // currently initializing
-            Ok(1) => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
+            Err(1) => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
 
             // initialized
-            _ => {}
+            Err(2) => {},
+
+            #[cfg(debug_assertions)]
+            _ => unreachable!(),
+            #[cfg(not(debug_assertions))]
+            _ => unsafe { unreachable_unchecked() }
         }
 
         unsafe { (&*self.value.get()).assume_init_ref() }
@@ -103,12 +99,7 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     /// Returns a mutable reference to the inner value, initializing or waiting for it of necesary
     #[inline(always)]
     pub fn get_mut (&mut self) -> &mut T {
-        match self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed) {
-            #[cfg(debug_assertions)]
-            Err(_) => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            Err(_) => unsafe { unreachable_unchecked() },
-
+        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             // uninitialized
             Ok(0) => unsafe {
                 let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
@@ -121,10 +112,15 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
             },
 
             // currently initializing
-            Ok(1) => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
+            Err(1) => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
 
             // initialized
-            _ => {}
+            Err(2) => {},
+
+            #[cfg(debug_assertions)]
+            _ => unreachable!(),
+            #[cfg(not(debug_assertions))]
+            _ => unsafe { unreachable_unchecked() }
         }
 
         unsafe { self.value.get_mut().assume_init_mut() }
@@ -236,18 +232,18 @@ impl<T, F> Drop for Lazy<T, F> {
     fn drop(&mut self) {
         match self.state.load(Ordering::Relaxed) {
             // uninit (drop function)
-            0 => unsafe { self.f.get_mut().assume_init_drop() },
+            0 => return unsafe { self.f.get_mut().assume_init_drop() },
 
-            // initializing (shouldn'r happen)
-            #[cfg(debug_assertions)]
-            1 => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            1 => unsafe { unreachable_unchecked() },
+            // currently initializing (wait for value)
+            1 => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
 
             // init (drop value)
-            _ => unsafe { self.value.get_mut().assume_init_drop() },
+            _ => {},
         }
+
+        unsafe { self.value.get_mut().assume_init_drop() }
     }
 }
 
+unsafe impl<T: Send, F: Send> Send for Lazy<T, F> {}
 unsafe impl<T: Sync, F: Sync> Sync for Lazy<T, F> {}
