@@ -150,6 +150,10 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     }
 
     /// Returns the inner value, initializing it if necessary
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initialization function ran, but panicked.
     #[inline(always)]
     pub fn into_inner (self) -> T {
         let mut this = ManuallyDrop::new(self);
@@ -161,11 +165,8 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
                 f()
             },
 
-            // initializing (shouldn't happen)
-            #[cfg(debug_assertions)]
-            INITIALIZING => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            INITIALIZING => unsafe { unreachable_unchecked() },
+            // initializing (happens if initialization panics)
+            INITIALIZING => panic!("initialization panicked"),
 
             // init
             _ => unsafe {
@@ -176,6 +177,10 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     }
 
     /// Attempts to return the inner value, returning an error if it hasn't initialized yet. The error contains the value's initializer
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initialization function ran, but panicked.
     #[inline(always)]
     pub fn try_into_inner (self) -> Result<T, F> {
         let mut this = ManuallyDrop::new(self);
@@ -187,11 +192,8 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
                 Err(f.assume_init())
             },
 
-            // initializing (shouldn't happen)
-            #[cfg(debug_assertions)]
-            INITIALIZING => unreachable!(),
-            #[cfg(not(debug_assertions))]
-            INITIALIZING => unsafe { unreachable_unchecked() },
+            // initializing (happens if initialization panics)
+            INITIALIZING => panic!("initialization panicked"),
 
             // init (get value)
             _ => unsafe {
