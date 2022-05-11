@@ -4,7 +4,9 @@ description = "A simple, stable and thread-safe implementation of a lazy value"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = ""
+repository = "https://github.com/Aandreba/laizy"
+keywords = ["lazy", "lazy value", "lazy evaluation", "lazy evaluation of values"]
+categories = ["algorithms", "asynchronous", "caching", "data-structures", "no-std"]
 
 [package.metadata.docs.rs]
 all-features = true
