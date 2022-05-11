@@ -16,12 +16,17 @@ pub struct AsyncLazy<T, F> {
     f: UnsafeCell<MaybeUninit<F>>
 }
 
+// Values that `AsyncLazy::state` can be
+const UNINIT: u8 = UNINIT;
+const INITIALIZING: u8 = INITIALIZING;
+const INIT: u8 = INIT;
+
 impl<T, F> AsyncLazy<T, F> {
     /// Builds a new ```AsyncLazy``` value
     #[inline(always)]
     pub const fn new (f: F) -> Self {
         Self {
-            state: AtomicU8::new(0),
+            state: AtomicU8::new(UNINIT),
             waker: AtomicWaker::new(),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             f: UnsafeCell::new(MaybeUninit::new(f))
@@ -32,7 +37,7 @@ impl<T, F> AsyncLazy<T, F> {
     #[inline(always)]
     pub const fn init (value: T) -> Self {
         Self {
-            state: AtomicU8::new(2),
+            state: AtomicU8::new(INIT),
             waker: AtomicWaker::new(),
             value: UnsafeCell::new(MaybeUninit::new(value)),
             f: UnsafeCell::new(MaybeUninit::uninit())
@@ -42,19 +47,19 @@ impl<T, F> AsyncLazy<T, F> {
     /// Returns ```true``` if the value is uninitialized, ```false``` otherwise
     #[inline(always)]
     pub fn is_uninit (&self) -> bool {
-        self.state.load(Ordering::Acquire) == 0
+        self.state.load(Ordering::Acquire) == UNINIT
     }
     
     /// Returns ```true``` if the value is currently initializing, ```false``` otherwise
     #[inline(always)]
     pub fn is_init (&self) -> bool {
-        self.state.load(Ordering::Acquire) == 1
+        self.state.load(Ordering::Acquire) == INITIALIZING
     }
     
     /// Returns ```true``` if the value has already initialized, ```false``` otherwise
     #[inline(always)]
     pub fn has_init (&self) -> bool {
-        self.state.load(Ordering::Acquire) > 1
+        self.state.load(Ordering::Acquire) > INITIALIZING
     }
 }
 
@@ -62,24 +67,24 @@ impl<T, F: Future<Output = T>> AsyncLazy<T, F> {
     /// Returns a reference to the inner value, initializing or waiting for it of necesary
     #[inline(always)]
     pub async fn get (&self) -> &T {
-        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+        match self.state.compare_exchange(UNINIT, INITIALIZING, Ordering::Acquire, Ordering::Relaxed) {
             // uninitialized
-            Ok(0) => unsafe {
+            Ok(UNINIT) => unsafe {
                 let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
                 (&mut *self.value.get()).write(f.assume_init().await);
 
                 #[cfg(debug_assertions)]
-                assert_eq!(self.state.swap(2, Ordering::Release), 1);
+                assert_eq!(self.state.swap(INIT, Ordering::Release), INITIALIZING);
                 #[cfg(not(debug_assertions))]
-                self.state.store(2, Ordering::Release);
+                self.state.store(INIT, Ordering::Release);
                 self.waker.wake();
             },
 
             // currently initializing
-            Err(1) => AwaitInit::new(2, &self.state, &self.waker).await,
+            Err(INITIALIZING) => AwaitInit::new(INIT, &self.state, &self.waker).await,
 
             // initialized
-            Err(2) => {},
+            Err(INIT) => {},
 
             #[cfg(debug_assertions)]
             _ => unreachable!(),
@@ -93,24 +98,24 @@ impl<T, F: Future<Output = T>> AsyncLazy<T, F> {
     /// Returns a mutable reference to the inner value, initializing or waiting for it of necesary
     #[inline(always)]
     pub async fn get_mut (&mut self) -> &mut T {
-        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+        match self.state.compare_exchange(UNINIT, INITIALIZING, Ordering::Acquire, Ordering::Relaxed) {
             // uninitialized
-            Ok(0) => unsafe {
+            Ok(UNINIT) => unsafe {
                 let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
                 (&mut *self.value.get()).write(f.assume_init().await);
 
                 #[cfg(debug_assertions)]
-                assert_eq!(self.state.swap(2, Ordering::Release), 1);
+                assert_eq!(self.state.swap(INIT, Ordering::Release), INITIALIZING);
                 #[cfg(not(debug_assertions))]
-                self.state.store(2, Ordering::Release);
+                self.state.store(INIT, Ordering::Release);
                 self.waker.wake();
             },
 
             // currently initializing
-            Err(1) => AwaitInit::new(2, &self.state, &self.waker).await,
+            Err(INITIALIZING) => AwaitInit::new(INIT, &self.state, &self.waker).await,
 
             // initialized
-            Err(2) => {},
+            Err(INIT) => {},
 
             #[cfg(debug_assertions)]
             _ => unreachable!(),
@@ -125,7 +130,7 @@ impl<T, F: Future<Output = T>> AsyncLazy<T, F> {
     #[inline(always)]
     pub fn try_get (&self) -> Option<&T> {
         match self.state.load(Ordering::Acquire) {
-            2 => unsafe { Some((&*self.value.get()).assume_init_ref()) }
+            INIT => unsafe { Some((&*self.value.get()).assume_init_ref()) }
             _ => None
         }
     }
@@ -134,7 +139,7 @@ impl<T, F: Future<Output = T>> AsyncLazy<T, F> {
     #[inline(always)]
     pub fn try_get_mut (&mut self) -> Option<&mut T> {
         match self.state.load(Ordering::Acquire) {
-            2 => unsafe { Some(self.value.get_mut().assume_init_mut()) }
+            INIT => unsafe { Some(self.value.get_mut().assume_init_mut()) }
             _ => None
         }
     }
@@ -146,14 +151,14 @@ impl<T, F: Future<Output = T>> AsyncLazy<T, F> {
 
         match this.state.load(Ordering::Relaxed) {
             // uninit (init value)
-            0 => unsafe { 
+            UNINIT => unsafe { 
                 let f = core::mem::replace(this.f.get_mut(), MaybeUninit::uninit()).assume_init();
                 f.await
             },
 
             // currently initializing
-            1 => unsafe {
-                AwaitInit::new(2, &this.state, &this.waker).await;
+            INITIALIZING => unsafe {
+                AwaitInit::new(INIT, &this.state, &this.waker).await;
                 let value = core::mem::replace(this.value.get_mut(), MaybeUninit::uninit());
                 value.assume_init()
             },
@@ -179,10 +184,10 @@ impl<T, F> Drop for AsyncLazy<T, F> {
     fn drop(&mut self) {
         match self.state.load(Ordering::Relaxed) {
             // uninit (drop future)
-            0 => return unsafe { self.f.get_mut().assume_init_drop() },
+            UNINIT => return unsafe { self.f.get_mut().assume_init_drop() },
 
             // currently initializing
-            1 => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
+            INITIALIZING => while self.state.load(Ordering::Acquire) == INITIALIZING { core::hint::spin_loop() },
 
             // init (drop value)
             _ => {}

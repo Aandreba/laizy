@@ -25,12 +25,17 @@ pub struct Lazy<T, F = fn() -> T> {
     f: UnsafeCell<MaybeUninit<F>>
 }
 
+// Values that `Lazy::state` can be
+const UNINIT: u8 = 0;
+const INITIALIZING: u8 = 1;
+const INIT: u8 = 2;
+
 impl<T, F> Lazy<T, F> {
     /// Builds a new ```Lazy``` value
     #[inline(always)]
     pub const fn new (f: F) -> Self {
         Self {
-            state: AtomicU8::new(0),
+            state: AtomicU8::new(UNINIT),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             f: UnsafeCell::new(MaybeUninit::new(f))
         }
@@ -40,7 +45,7 @@ impl<T, F> Lazy<T, F> {
     #[inline(always)]
     pub const fn init (value: T) -> Self {
         Self {
-            state: AtomicU8::new(2),
+            state: AtomicU8::new(INIT),
             value: UnsafeCell::new(MaybeUninit::new(value)),
             f: UnsafeCell::new(MaybeUninit::uninit())
         }
@@ -49,19 +54,19 @@ impl<T, F> Lazy<T, F> {
     /// Returns ```true``` if the value is uninitialized, ```false``` otherwise
     #[inline(always)]
     pub fn is_uninit (&self) -> bool {
-        self.state.load(Ordering::Acquire) == 0
+        self.state.load(Ordering::Acquire) == UNINIT
     }
     
     /// Returns ```true``` if the value is currently initializing, ```false``` otherwise
     #[inline(always)]
     pub fn is_init (&self) -> bool {
-        self.state.load(Ordering::Acquire) == 1
+        self.state.load(Ordering::Acquire) == INITIALIZING
     }
     
     /// Returns ```true``` if the value has already initialized, ```false``` otherwise
     #[inline(always)]
     pub fn has_init (&self) -> bool {
-        self.state.load(Ordering::Acquire) == 2
+        self.state.load(Ordering::Acquire) == INIT
     }
 }
 
@@ -69,23 +74,23 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     /// Returns a reference to the inner value, initializing or waiting for it of necesary
     #[inline(always)]
     pub fn get (&self) -> &T {
-        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+        match self.state.compare_exchange(UNINIT, INITIALIZING, Ordering::Acquire, Ordering::Relaxed) {
             // uninitialized
-            Ok(0) => unsafe {
+            Ok(UNINIT) => unsafe {
                 let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
                 (&mut *self.value.get()).write((f.assume_init())());
 
                 #[cfg(debug_assertions)]
-                assert_eq!(self.state.swap(2, Ordering::Release), 1);
+                assert_eq!(self.state.swap(INIT, Ordering::Release), INITIALIZING);
                 #[cfg(not(debug_assertions))]
-                self.state.store(2, Ordering::Release);
+                self.state.store(INIT, Ordering::Release);
             },
 
             // currently initializing
-            Err(1) => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
+            Err(INITIALIZING) => while self.state.load(Ordering::Acquire) == INITIALIZING { core::hint::spin_loop() },
 
             // initialized
-            Err(2) => {},
+            Err(INIT) => {},
 
             #[cfg(debug_assertions)]
             _ => unreachable!(),
@@ -99,23 +104,23 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     /// Returns a mutable reference to the inner value, initializing or waiting for it of necesary
     #[inline(always)]
     pub fn get_mut (&mut self) -> &mut T {
-        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+        match self.state.compare_exchange(UNINIT, INITIALIZING, Ordering::Acquire, Ordering::Relaxed) {
             // uninitialized
-            Ok(0) => unsafe {
+            Ok(UNINIT) => unsafe {
                 let f = core::mem::replace(&mut *self.f.get(), MaybeUninit::uninit());
                 self.value.get_mut().write((f.assume_init())());
 
                 #[cfg(debug_assertions)]
-                assert_eq!(self.state.swap(2, Ordering::Release), 1);
+                assert_eq!(self.state.swap(INIT, Ordering::Release), INITIALIZING);
                 #[cfg(not(debug_assertions))]
-                self.state.store(2, Ordering::Release);
+                self.state.store(INIT, Ordering::Release);
             },
 
             // currently initializing
-            Err(1) => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
+            Err(INITIALIZING) => while self.state.load(Ordering::Acquire) == INITIALIZING { core::hint::spin_loop() },
 
             // initialized
-            Err(2) => {},
+            Err(INIT) => {},
 
             #[cfg(debug_assertions)]
             _ => unreachable!(),
@@ -130,7 +135,7 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     #[inline(always)]
     pub fn try_get (&self) -> Option<&T> {
         match self.state.load(Ordering::Acquire) {
-            2 => unsafe { Some((&*self.value.get()).assume_init_ref()) }
+            INIT => unsafe { Some((&*self.value.get()).assume_init_ref()) }
             _ => None
         }
     }
@@ -139,7 +144,7 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     #[inline(always)]
     pub fn try_get_mut (&mut self) -> Option<&mut T> {
         match self.state.load(Ordering::Acquire) {
-            2 => unsafe { Some(self.value.get_mut().assume_init_mut()) }
+            INIT => unsafe { Some(self.value.get_mut().assume_init_mut()) }
             _ => None
         }
     }
@@ -151,16 +156,16 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
 
         match this.state.load(Ordering::Relaxed) {
             // uninit (init value)
-            0 => unsafe { 
+            UNINIT => unsafe { 
                 let f = core::mem::replace(this.f.get_mut(), MaybeUninit::uninit()).assume_init();
                 f()
             },
 
             // initializing (shouldn't happen)
             #[cfg(debug_assertions)]
-            1 => unreachable!(),
+            INITIALIZING => unreachable!(),
             #[cfg(not(debug_assertions))]
-            1 => unsafe { unreachable_unchecked() },
+            INITIALIZING => unsafe { unreachable_unchecked() },
 
             // init
             _ => unsafe {
@@ -177,16 +182,16 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
 
         match this.state.load(Ordering::Relaxed) {
             // uninit (get function)
-            0 => unsafe { 
+            UNINIT => unsafe { 
                 let f = core::mem::replace(this.f.get_mut(), MaybeUninit::uninit());
                 Err(f.assume_init())
             },
 
             // initializing (shouldn't happen)
             #[cfg(debug_assertions)]
-            1 => unreachable!(),
+            INITIALIZING => unreachable!(),
             #[cfg(not(debug_assertions))]
-            1 => unsafe { unreachable_unchecked() },
+            INITIALIZING => unsafe { unreachable_unchecked() },
 
             // init (get value)
             _ => unsafe {
@@ -232,10 +237,10 @@ impl<T, F> Drop for Lazy<T, F> {
     fn drop(&mut self) {
         match self.state.load(Ordering::Relaxed) {
             // uninit (drop function)
-            0 => return unsafe { self.f.get_mut().assume_init_drop() },
+            UNINIT => return unsafe { self.f.get_mut().assume_init_drop() },
 
             // currently initializing (wait for value)
-            1 => while self.state.load(Ordering::Acquire) == 1 { core::hint::spin_loop() },
+            INITIALIZING => while self.state.load(Ordering::Acquire) == INITIALIZING { core::hint::spin_loop() },
 
             // init (drop value)
             _ => {},
